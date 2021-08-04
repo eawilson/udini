@@ -1,0 +1,5 @@
+udini
+*.o
+*.out
+*.txt
+*.fastq
