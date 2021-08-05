@@ -12,32 +12,35 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include "zlib.h"
 
 
 const int NAME = 0;
 const int SEQ = 1;
 const int PLUS = 2;
 const int QUAL = 3;
+const unsigned GZBUFFER_LEN = 1024 * 1024;
+const size_t LINE_LEN = 1024;
 
 
 bool endswith(const char *text, const char *suffix);
-
 
 
 int main (int argc, char **argv) {
     /*
      * 
      */
-    const char *output_filename = NULL, *stats_filename = "stats.json", *umi_sequences = NULL;
+    const char *output_filename = "-", *stats_filename = "stats.json", *umi_sequences = NULL;
     char **input_filenames = NULL, *umi_buffer = NULL, **valid_umis = NULL, *lines[2][4] = {NULL}, *umis[2] = {NULL}, ch = '\0';
     bool interleaved = false, whitespace = true, validated_umis = true, invalid_short_read = false, invalid_n_read = false;
     int umi_length = 0, umi_stem_length = 0, min_read_length = 50;
     int lineno = 0, readno = 0, consecutive_ns = 0, max_consecutive_ns = 2, i = 0;
     int best = 0, nextbest = 0, edit_distance = 0, j = 0;
     size_t input_filenames_len = 0, umi_buffer_len = 0, valid_umis_len = 0, current_input_filename = 0;
-    size_t total_reads = 0, invalid_umi_reads[2] = {0}, invalid_short_reads = 0, invalid_n_reads = 0;
+    size_t total_reads = 0, invalid_umi_reads[2] = {0}, invalid_short_reads = 0, invalid_n_reads = 0, length = 0;
     size_t line_lens[2][4] = {0}, seq_len = 0, qual_len = 0;
-    FILE *input_fastqs[2] = {NULL}, *output_fastq = NULL, *stats_file = NULL;
+    gzFile output_fastq = NULL, input_fastqs[2] = {NULL};
+    FILE *stats_file = NULL;
 
     // variable needed by strtol
     char *endptr = NULL;
@@ -165,7 +168,7 @@ int main (int argc, char **argv) {
                 // help message
                 fprintf(stderr, "Program: udini\n");
                 fprintf(stderr, "Version: 2.0.0\n");
-                fprintf(stderr, "Usage:   udini input_fastq(s) [options]\n");
+                fprintf(stderr, "Usage:   udini [options] input_fastq(s)\n");
                 fprintf(stderr, "Options: -o, --output STR              Name of output fastq/fastq.gz or '-' for \n");
                 fprintf(stderr, "                                       stdout (default '-')\n");
                 fprintf(stderr, "         -u, --umi STR                 Known UMI type (one of 'thruplex', \n");
@@ -193,7 +196,7 @@ int main (int argc, char **argv) {
         }
     
     input_filenames_len = argc - optind;
-    input_filenames = argv;
+    input_filenames = argv + optind;
     if (input_filenames_len == 0) {
         fprintf(stderr, "Error: No input file supplied\n");
         exit(EXIT_FAILURE);
@@ -260,16 +263,35 @@ int main (int argc, char **argv) {
     
     
     if (strcmp(output_filename, "-") == 0) {
-        output_fastq = stdout;
+        if ((output_fastq = gzdopen(dup(fileno(stdout)), "wbT")) == NULL) {
+            fprintf(stderr, "Error: Unable to open stdout for writing\n");
+            exit(EXIT_FAILURE);
+            }
         }
     else if (endswith(output_filename, ".fastq")) {
-        if ((output_fastq = fopen(output_filename, "w")) == NULL) {
+        if ((output_fastq = gzopen(output_filename, "wbT")) == NULL) {
             fprintf(stderr, "Error: Unable to open %s for writing\n", input_filenames[current_input_filename]);
             exit(EXIT_FAILURE);
             }
         }
-    else {
-        // fastq.gz
+    else { // fastq.gz
+        if ((output_fastq = gzopen(output_filename, "wb")) == NULL) {
+            fprintf(stderr, "Error: Unable to open %s for writing\n", input_filenames[current_input_filename]);
+            exit(EXIT_FAILURE);
+            }
+        if (gzbuffer(output_fastq, GZBUFFER_LEN) == -1) {
+            fprintf(stderr, "Error: Unable to set gzbuffer size\n");
+            exit(EXIT_FAILURE);
+            }
+        }
+    
+    
+    for (i = 0; i < 8; ++i) {
+        line_lens[i / 4][i % 4] = LINE_LEN;
+        if ((lines[i / 4][i % 4] = malloc(line_lens[i / 4][i % 4] + 1)) == NULL) {
+            fprintf(stderr, "Error: Unable to allocate memory for line buffer\n");
+            exit(EXIT_FAILURE);
+            }
         }
     
     
@@ -277,21 +299,28 @@ int main (int argc, char **argv) {
         
         for (readno = 0; readno < 2; ++readno) {
             if (strcmp(input_filenames[current_input_filename], "-") == 0) {
-                input_fastqs[readno] = stdin;
-                }
-            else if (endswith(input_filenames[current_input_filename], ".fastq")) {
-                if ((input_fastqs[readno] = fopen(input_filenames[current_input_filename], "r")) == NULL) {
-                    fprintf(stderr, "Error: Unable to open %s for reading\n", input_filenames[current_input_filename]);
+                if ((input_fastqs[readno] = gzdopen(dup(fileno(stdin)), "rb")) == NULL) {
+                    fprintf(stderr, "Error: Unable to open stdin for reading\n");
                     exit(EXIT_FAILURE);
                     }
                 }
             else {
-                // fastq.gz
+                if ((input_fastqs[readno] = gzopen(input_filenames[current_input_filename], "rb")) == NULL) {
+                    fprintf(stderr, "Error: Unable to open %s for reading\n", input_filenames[current_input_filename]);
+                    exit(EXIT_FAILURE);
+                    }
+                }
+            if (gzbuffer(input_fastqs[readno], GZBUFFER_LEN) == -1) {
+                fprintf(stderr, "Error: Unable to set gzbuffer size\n");
+                exit(EXIT_FAILURE);
                 }
             
             if (interleaved) {
                 input_fastqs[1] = input_fastqs[0];
                 break;
+                }
+            else {
+                ++current_input_filename;
                 }
             }
         
@@ -300,30 +329,45 @@ int main (int argc, char **argv) {
             for (i = 0; i < 8; ++i) {
                 readno = i / 4;
                 lineno = i % 4;
-                if (getline(&lines[readno][lineno], &line_lens[readno][lineno], input_fastqs[readno]) == -1) {
-                    if (feof(input_fastqs[readno])) {
-                        if (i == 0 && fgetc(input_fastqs[1]) == EOF && feof(input_fastqs[1])) {
-                            break;
+
+                length = 0;
+                while (true) {
+                    if (gzgets(input_fastqs[readno], lines[readno][lineno] + length, line_lens[readno][lineno] - length) == NULL) {
+                        if (gzeof(input_fastqs[readno])) {
+                            if (i == 0 && gzgetc(input_fastqs[1]) == -1 && gzeof(input_fastqs[1])) {
+                                i = 8;
+                                break;
+                                }
+                            fprintf(stderr, "Error: Truncated fastq\n");
                             }
-                        fprintf(stderr, "Error: Truncated fastq\n");
+                        else {
+                            fprintf(stderr, "Error: Unable to read fastq\n");
+                            }
+                        exit(EXIT_FAILURE);
+                        
                         }
-                    else if (errno == ENOMEM) {
-                        fprintf(stderr, "Error: Unable to allocate memory for fastq line\n");
+                    length += strlen(lines[readno][lineno] + length);
+                    if (lines[readno][lineno][length - 1] == '\n') {
+                        lines[readno][lineno][--length] = '\0';
+                        if (lines[readno][lineno][length - 1] == '\r') {
+                            lines[readno][lineno][--length] = '\0';
+                            }
+                        break;
                         }
-                    else {
-                        fprintf(stderr, "Error: Unable to read fastq\n");
+                    
+                    line_lens[readno][lineno] += LINE_LEN;
+                    if ((lines[readno][lineno] = realloc(lines[readno][lineno], line_lens[readno][lineno] + 1)) == NULL) {
+                        fprintf(stderr, "Error: Unable to reallocate memory for line buffer.\n");
+                        exit(EXIT_FAILURE);
                         }
-                    exit(EXIT_FAILURE);
                     }
                 }
             
-            if (i < 8) {
+            if (i == 9) {
                 for (readno = 0; readno < 2; ++readno) {
-                    if (input_fastqs[readno] != stdin) {
-                        if (fclose(input_fastqs[readno]) == EOF) {
-                            fprintf(stderr, "Error: Unable to close fastq\n");
-                            exit(EXIT_FAILURE);
-                            }
+                    if (gzclose(input_fastqs[readno]) != Z_OK) {
+                        fprintf(stderr, "Error: Unable to successfully close fastq\n");
+                        exit(EXIT_FAILURE);
                         }
                     if (interleaved) {
                         break;
@@ -337,13 +381,7 @@ int main (int argc, char **argv) {
             invalid_short_read = false;
             for (readno = 0; readno < 2; ++readno) {
                 seq_len = strlen(lines[readno][SEQ]);
-                while (isspace(lines[readno][SEQ][seq_len - 1])) {
-                    lines[readno][SEQ][--seq_len] = '\0';
-                    }
                 qual_len = strlen(lines[readno][QUAL]);
-                while (isspace(lines[readno][QUAL][qual_len - 1])) {
-                    lines[readno][QUAL][--qual_len] = '\0';
-                    }
                 if (seq_len != qual_len) {
                     fprintf(stderr, "Error: Sequence and quality differ in length\n");
                     exit(EXIT_FAILURE);
@@ -433,38 +471,42 @@ int main (int argc, char **argv) {
                 
                 if (validated_umis) {
                     for (readno = 0; readno < 2; ++readno) {
-                        fprintf(output_fastq, "%s RX:Z:%.*s-%.*s\tQX:Z:%.*s %.*s\n%s\n+\n%s\n",
-                                              lines[readno][NAME],
-                                              umi_length,
-                                              umis[0],
-                                              umi_length,
-                                              umis[1],
-                                              umi_length,
-                                              lines[0][QUAL],
-                                              umi_length,
-                                              lines[1][QUAL],
-                                              lines[readno][SEQ] + umi_length + umi_stem_length,
-                                              lines[readno][QUAL] + umi_length + umi_stem_length);
+                        if (gzprintf(output_fastq, "%s RX:Z:%.*s-%.*s\tQX:Z:%.*s %.*s\n%s\n+\n%s\n",
+                                                   lines[readno][NAME],
+                                                   umi_length,
+                                                   umis[0],
+                                                   umi_length,
+                                                   umis[1],
+                                                   umi_length,
+                                                   lines[0][QUAL],
+                                                   umi_length,
+                                                   lines[1][QUAL],
+                                                   lines[readno][SEQ] + umi_length + umi_stem_length,
+                                                   lines[readno][QUAL] + umi_length + umi_stem_length) < 0) {
+                            fprintf(stderr, "Error: Unable to write to output fastq\n");
+                            exit(EXIT_FAILURE);
+                            }
                         }
                     }
                 }
             else {
                 for (readno = 0; readno < 2; ++readno) {
-                    fprintf(output_fastq, "%s\n%s\n+\n%s\n",
-                                          lines[readno][NAME],
-                                          lines[readno][SEQ] + umi_stem_length,
-                                          lines[readno][QUAL] + umi_stem_length);
+                    if (gzprintf(output_fastq, "%s\n%s\n+\n%s\n",
+                                               lines[readno][NAME],
+                                               lines[readno][SEQ] + umi_stem_length,
+                                               lines[readno][QUAL] + umi_stem_length) < 0) {
+                        fprintf(stderr, "Error: Unable to write to output fastq\n");
+                        exit(EXIT_FAILURE);
+                        }
                     }      
                 }
             }
         }        
     
     
-    if (output_fastq != stdout) {
-        if (fclose(output_fastq) == EOF) {
-            fprintf(stderr, "Error: Unable to close output fastq\n");
-            exit(EXIT_FAILURE);
-            }
+    if (gzclose(output_fastq) != Z_OK) {
+        fprintf(stderr, "Error: Unable to successfully close output fastq\n");
+        exit(EXIT_FAILURE);
         }
     
 
@@ -510,7 +552,11 @@ int main (int argc, char **argv) {
         fprintf(stderr, "Error: Unable to close stats file\n");
         exit(EXIT_FAILURE);
         }
-
+    
+    free(umi_buffer);
+    for (i = 0; i <8; ++i) {
+        free(lines[i / 4][i % 4]);
+        }
     }
 
 
