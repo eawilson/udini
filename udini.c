@@ -297,7 +297,7 @@ int main (int argc, char **argv) {
     
     for (current_input_filename = 0; current_input_filename < input_filenames_len; ++current_input_filename) {
         
-        for (readno = 0; readno < 2; ++readno) {
+        for (readno = 0;; ++readno) {
             if (strcmp(input_filenames[current_input_filename], "-") == 0) {
                 if ((input_fastqs[readno] = gzdopen(dup(fileno(stdin)), "rb")) == NULL) {
                     fprintf(stderr, "Error: Unable to open stdin for reading\n");
@@ -315,6 +315,10 @@ int main (int argc, char **argv) {
                 exit(EXIT_FAILURE);
                 }
             
+            if (readno == 1) {
+                break;
+                }
+        
             if (interleaved) {
                 input_fastqs[1] = input_fastqs[0];
                 break;
