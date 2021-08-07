@@ -96,7 +96,7 @@ int main (int argc, char **argv) {
                                     "TTGCAGAC GTCGAAGA CAATGTGG ACCACGAT ACGACTTG "
                                     "GATTACCG ACTAGGAG";
                     }
-                else {
+                else if (strlen(optarg) > 0) {
                     fprintf(stderr, "Error: Unsupported umi type: %s\n", optarg);
                     exit(EXIT_FAILURE);
                     }
